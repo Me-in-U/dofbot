@@ -13,11 +13,11 @@ from . import agents
 
 
 gym.register(
-    id="Template-Dofbot-Direct-v0",
-    entry_point=f"{__name__}.dofbot_env:DofbotEnv",
+    id="Dofbot-PickPlace-Direct-v0",
+    entry_point=f"{__name__}.dofbot_pickplace_env:DofbotPickPlaceEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.dofbot_env_cfg:DofbotEnvCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        "env_cfg_entry_point": f"{__name__}.dofbot_pickplace_env_cfg:DofbotPickPlaceEnvCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_pickplace_cfg.yaml",
     },
 )
