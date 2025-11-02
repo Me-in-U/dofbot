@@ -145,7 +145,14 @@ class DofbotPickPlaceEnvCfg(DirectRLEnvCfg):
     robot_cfg: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
         spawn=sim_utils.UsdFileCfg(usd_path=robot_usd_path),
-        actuators={},  # Direct joint target control (velocity/effort) without explicit actuator configs
+        init_state=ArticulationCfg.InitialStateCfg(
+            pos=(0.0, 0.0, 0.0),
+            joint_pos={
+                "arm_joint.*": 0.0,
+                "grip_joint": 0.0,
+            },
+        ),
+        actuators={},  # Direct control - no actuator models needed
         articulation_root_prim_path=articulation_root_prim_path,
     )
 
@@ -165,16 +172,16 @@ class DofbotPickPlaceEnvCfg(DirectRLEnvCfg):
     gripper_dof_name = "grip_joint"
     ee_link_name = "arm_link5"
 
-    # Action scaling
-    joint_vel_scale = 1.0  # rad/s normalized by [-1, 1]
-    grip_vel_scale = 1.0  # deg/s or normalized unit
+    # Action scaling - CHANGED to velocity control (effort not working)
+    joint_velocity_scale = 1.0  # rad/s - joint velocity limits
+    grip_velocity_scale = 0.5  # rad/s - gripper velocity limit
 
-    # Object/Goal 배치 범위 (테이블 중심 근처)
-    table_height = 0.0
+    # Object/Goal 배치 범위 (로봇 바로 앞, 매우 가깝게)
+    table_height = 0.05  # 테이블 높이
     object_size = 0.03
-    object_xy_range = (-0.15, 0.15)
-    goal_xy_range = (-0.20, 0.20)
-    goal_height = 0.10
+    object_xy_range = (-0.08, 0.08)  # 로봇 바로 앞
+    goal_xy_range = (-0.10, 0.10)  # 약간 더 넓은 범위
+    goal_height = 0.12  # 로봇이 도달 가능한 높이
 
     # Rewards
     rew_scale_alive = 0.1

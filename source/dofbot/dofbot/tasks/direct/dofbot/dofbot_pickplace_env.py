@@ -37,10 +37,21 @@ class DofbotPickPlaceEnv(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         # Resolve indices
-        self._arm_dof_idx, _ = self.robot.find_joints(self.cfg.arm_dof_names)
-        self._grip_dof_idx, _ = self.robot.find_joints(self.cfg.gripper_dof_name)
+        self._arm_dof_idx, arm_names = self.robot.find_joints(self.cfg.arm_dof_names)
+        self._grip_dof_idx, grip_names = self.robot.find_joints(
+            self.cfg.gripper_dof_name
+        )
         # End-effector link index (for pose)
         self._ee_body_idx, _ = self.robot.find_bodies(self.cfg.ee_link_name)
+
+        # Debug: Print joint information
+        print("\n[DofbotPickPlaceEnv] Joint Configuration:")
+        print(f"  Total robot joints: {self.robot.num_joints}")
+        print(f"  All joint names: {self.robot.joint_names}")
+        print(f"  Arm DOF indices: {self._arm_dof_idx}")
+        print(f"  Arm DOF names: {arm_names}")
+        print(f"  Gripper DOF indices: {self._grip_dof_idx}")
+        print(f"  Gripper DOF names: {grip_names}")
 
         # Shortcuts to buffers
         self.joint_pos = self.robot.data.joint_pos
@@ -50,13 +61,30 @@ class DofbotPickPlaceEnv(DirectRLEnv):
         self.obj_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
         self.goal_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
 
+        # Configure joint drives after scene setup
+        self._configure_joint_drives()
+
+        # Debug: Check if Object/Goal exist in multiple environments
+        print("\n[DofbotPickPlaceEnv] Checking Object/Goal in environments:")
+        stage = self.sim.stage
+        for env_idx in [0, 1, 2, 255]:  # Check first 3 and last env
+            obj_path = f"/World/envs/env_{env_idx}/Object"
+            goal_path = f"/World/envs/env_{env_idx}/Goal"
+            obj_exists = stage.GetPrimAtPath(obj_path).IsValid()
+            goal_exists = stage.GetPrimAtPath(goal_path).IsValid()
+            print(f"  env_{env_idx}: Object={obj_exists}, Goal={goal_exists}")
+
     # Scene ------------------------------------------------------------------
     def _setup_scene(self):
         # Robot
         self.robot = Articulation(self.cfg.robot_cfg)
 
-        # Ground
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+        # Ground - 밝은 회색 바닥 (렌더링 문제 해결)
+        ground_cfg = GroundPlaneCfg(
+            color=(0.4, 0.4, 0.4),  # 중간 회색
+            size=(100.0, 100.0),
+        )
+        spawn_ground_plane(prim_path="/World/ground", cfg=ground_cfg)
 
         # Visual helpers: goal marker (sphere) and object (cube)
         # Note: 스포너는 소스 env에만 생성 후 clone_environments로 복제됨
@@ -70,38 +98,107 @@ class DofbotPickPlaceEnv(DirectRLEnv):
         # Register
         self.scene.articulations["robot"] = self.robot
 
-        # Light
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.8, 0.8, 0.8))
+        # Light - 더 밝게
+        light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(1.0, 1.0, 1.0))
         light_cfg.func("/World/Light", light_cfg)
 
     def _spawn_pickplace_assets(self):
-        # Object cube
+        # Object cube - 밝은 빨간색 큐브
         cube_cfg = sim_utils.CuboidCfg(
             size=(self.cfg.object_size, self.cfg.object_size, self.cfg.object_size),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.05),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(1.0, 0.0, 0.0),  # 빨간색
+                metallic=0.2,
+                roughness=0.4,
+            ),
         )
         # Spawn under source env so that scene.clone_environments can replicate per env
         cube_cfg.func("/World/envs/env_0/Object", cube_cfg)
 
-        # Goal sphere (visual only)
+        # Goal sphere - 밝은 녹색 구체
         goal_cfg = sim_utils.SphereCfg(
-            radius=0.02,
+            radius=0.03,  # 크기 증가
             rigid_props=None,
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.0, 1.0, 0.0),  # 녹색
+                emissive_color=(0.0, 0.5, 0.0),  # 발광 효과
+                metallic=0.0,
+                roughness=0.3,
+            ),
         )
         goal_cfg.func("/World/envs/env_0/Goal", goal_cfg)
+
+    def _configure_joint_drives(self):
+        """Configure joint drive properties for VELOCITY control for all environments."""
+        from pxr import UsdPhysics
+
+        # Get USD stage from simulation context
+        stage = self.sim.stage
+
+        print("\n[DofbotPickPlaceEnv] Configuring joint drives for VELOCITY control...")
+        # Configure drives for ALL environments (not just env_0)
+        for env_idx in range(self.num_envs):
+            for joint_name in self.cfg.arm_dof_names + [self.cfg.gripper_dof_name]:
+                joint_path = f"/World/envs/env_{env_idx}/Robot/yahboom_dofbot/joints/{joint_name}"
+                joint_prim = stage.GetPrimAtPath(joint_path)
+
+                if joint_prim and joint_prim.IsValid():
+                    # Get or create drive API
+                    drive_api = UsdPhysics.DriveAPI.Apply(joint_prim, "angular")
+
+                    # Set drive parameters for VELOCITY control
+                    # High stiffness + high damping = good velocity tracking
+                    drive_api.CreateDampingAttr(
+                        1000.0
+                    )  # High damping for velocity control
+                    drive_api.CreateStiffnessAttr(
+                        0.0
+                    )  # Zero stiffness for velocity mode
+                    drive_api.CreateMaxForceAttr(
+                        1000.0
+                    )  # High force to achieve velocities
+
+                    if env_idx == 0:  # Only print for first env
+                        print(
+                            f"  Set drive for {joint_name}: damping=1000.0, stiffness=0.0, maxForce=1000.0"
+                        )
 
     # Control/Step -----------------------------------------------------------
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = actions.clamp(-1.0, 1.0)
 
     def _apply_action(self) -> None:
-        # Split arm and gripper
-        arm_actions = self.actions[:, :5] * self.cfg.joint_vel_scale
-        grip_action = self.actions[:, 5:6] * self.cfg.grip_vel_scale
-        # Apply joint velocity targets
-        self.robot.set_joint_velocity_target(arm_actions, joint_ids=self._arm_dof_idx)
-        self.robot.set_joint_velocity_target(grip_action, joint_ids=self._grip_dof_idx)
+        # CHANGED: Use velocity control instead of effort (effort not working properly)
+        # Split arm (5 joints) and gripper (1 joint)
+        arm_velocities = self.actions[:, :5] * self.cfg.joint_velocity_scale
+        grip_velocity = self.actions[:, 5:6] * self.cfg.grip_velocity_scale
+
+        # Debug: Print first environment's action and joint state every 100 steps
+        if hasattr(self, "_step_count"):
+            self._step_count += 1
+        else:
+            self._step_count = 0
+
+        if self._step_count % 100 == 0:
+            print(f"\n[Step {self._step_count}] First {min(2, self.num_envs)} envs:")
+            for i in range(min(2, self.num_envs)):
+                joint_pos = self.joint_pos[i, self._arm_dof_idx].cpu().numpy()
+                joint_vel = self.joint_vel[i, self._arm_dof_idx].cpu().numpy()
+                print(
+                    f"  Env {i}: action={self.actions[i, :3].cpu().numpy()}, pos={joint_pos[:3]}, vel={joint_vel[:3]}"
+                )
+
+        # Robot has 11 total joints, but we only control 6 (5 arm + 1 gripper)
+        # Need to specify velocities for all joints - set uncontrolled joints to 0
+        all_velocities = torch.zeros(
+            (self.num_envs, self.robot.num_joints), device=self.device
+        )
+        all_velocities[:, self._arm_dof_idx] = arm_velocities
+        all_velocities[:, self._grip_dof_idx] = grip_velocity
+
+        self.robot.set_joint_velocity_target(all_velocities)
 
     # Observations/Rewards/Dones --------------------------------------------
     def _get_observations(self) -> dict:
