@@ -7,11 +7,25 @@ from __future__ import annotations
 import os
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg
+from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
+
+
+@configclass
+class DofbotSceneCfg(InteractiveSceneCfg):
+    """Scene definition with a shared ground plane."""
+
+    ground = AssetBaseCfg(
+        prim_path="/World/ground",
+        spawn=sim_utils.GroundPlaneCfg(
+            color=(0.4, 0.4, 0.4), size=(100.0, 100.0), visible=True
+        ),
+        collision_group=-1,
+    )
 
 
 @configclass
@@ -152,13 +166,67 @@ class DofbotPickPlaceEnvCfg(DirectRLEnvCfg):
                 "grip_joint": 0.0,
             },
         ),
-        actuators={},  # Direct control - no actuator models needed
+        actuators={
+            "arm": ImplicitActuatorCfg(
+                joint_names_expr=["arm_joint[1-5]"],
+                stiffness=0.0,
+                damping=40.0,
+                effort_limit_sim=40.0,
+            ),
+            "gripper": ImplicitActuatorCfg(
+                joint_names_expr=["grip_joint"],
+                stiffness=0.0,
+                damping=10.0,
+                effort_limit_sim=20.0,
+            ),
+        },
         articulation_root_prim_path=articulation_root_prim_path,
     )
 
+    # Object (빨간 큐브) - RigidObject로 물리 시뮬레이션 지원
+    object_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Object",
+        spawn=sim_utils.CuboidCfg(
+            size=(0.03, 0.03, 0.03),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                disable_gravity=False,
+                max_depenetration_velocity=1.0,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.05),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(1.0, 0.0, 0.0),
+                metallic=0.2,
+                roughness=0.4,
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.1)),
+    )
+
+    # Goal (초록 구체) - 정적 마커 (중력 없음, kinematic)
+    goal_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Goal",
+        spawn=sim_utils.SphereCfg(
+            radius=0.03,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,  # Kinematic - 움직이지 않음
+                disable_gravity=True,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.0, 1.0, 0.0),
+                emissive_color=(0.0, 0.5, 0.0),
+                metallic=0.0,
+                roughness=0.3,
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.2, 0.0, 0.15)),
+    )
+
     # Scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=256, env_spacing=2.0, replicate_physics=True
+    scene: DofbotSceneCfg = DofbotSceneCfg(
+        num_envs=256, env_spacing=1.0, replicate_physics=True
     )
 
     # Joint/Link names
@@ -179,16 +247,32 @@ class DofbotPickPlaceEnvCfg(DirectRLEnvCfg):
     # Object/Goal 배치 범위 (로봇 바로 앞, 매우 가깝게)
     table_height = 0.05  # 테이블 높이
     object_size = 0.03
-    object_xy_range = (-0.08, 0.08)  # 로봇 바로 앞
-    goal_xy_range = (-0.10, 0.10)  # 약간 더 넓은 범위
+    object_xy_range = (-0.3, 0.3)  # 로봇 앞쪽으로 훨씬 넓은 샘플링 범위
+    goal_xy_range = (-0.3, 0.3)  # 목표 배치
     goal_height = 0.12  # 로봇이 도달 가능한 높이
+    object_min_radius = 0.15  # 로봇 베이스로부터 최소 거리
+    goal_min_radius = 0.25
+    placement_front_only = True  # 로봇 정면 180도 영역에만 배치
+    placement_front_axis = "y"  # 베이스 정면이 +X 축이라고 가정 (필요 시 'y' 지정)
+    goal_object_min_separation = 0.30  # 오브젝트-목표 최소 수평 거리
 
     # Rewards
     rew_scale_alive = 0.1
     rew_scale_reach = -1.0
-    rew_scale_transport = -1.0
+    rew_scale_transport = 0.0  # legacy term (disabled)
+    rew_scale_close = 1.5  # reward closing the gripper near the object
+    rew_scale_lift = 3.0  # reward lifting the object off the table
+    rew_scale_goal_track = -2.0  # encourage bringing object toward goal while grasped
+    rew_penalty_open = -0.5  # penalize keeping gripper open near the object
     rew_bonus_grasp = 2.0
     rew_bonus_place = 5.0
+
+    # Grasp heuristics
+    pre_grasp_threshold = 0.05
+    grip_closed_threshold = -0.30
+    grip_open_threshold = 0.05
+    grip_close_range = 0.30
+    lift_height_target = 0.20
 
     # Success/termination
     grasp_threshold = 0.03

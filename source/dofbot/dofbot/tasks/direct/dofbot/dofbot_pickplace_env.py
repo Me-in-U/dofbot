@@ -6,13 +6,21 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
 
-import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation
-from isaaclab.envs import DirectRLEnv
-from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+import isaaclab.sim as sim_utils  # type: ignore[import]
+from isaaclab.assets import Articulation, RigidObject, RigidObjectCfg  # type: ignore[import]
+from isaaclab.envs import DirectRLEnv  # type: ignore[import]
+from pxr import UsdGeom  # type: ignore[import]
+
+if TYPE_CHECKING:
+    from isaacsim.core.utils import prims as prim_utils  # type: ignore[import]
+else:
+    import importlib
+
+    prim_utils = importlib.import_module("isaacsim.core.utils.prims")
 
 from .dofbot_pickplace_env_cfg import DofbotPickPlaceEnvCfg
 
@@ -36,108 +44,102 @@ class DofbotPickPlaceEnv(DirectRLEnv):
     ):
         super().__init__(cfg, render_mode, **kwargs)
 
-        # Resolve indices
-        self._arm_dof_idx, arm_names = self.robot.find_joints(self.cfg.arm_dof_names)
-        self._grip_dof_idx, grip_names = self.robot.find_joints(
-            self.cfg.gripper_dof_name
+        # Resolve indices (preserve configured order)
+        self._arm_dof_idx, _ = self.robot.find_joints(
+            self.cfg.arm_dof_names, preserve_order=True
+        )
+        self._grip_dof_idx, _ = self.robot.find_joints(
+            self.cfg.gripper_dof_name, preserve_order=True
         )
         # End-effector link index (for pose)
         self._ee_body_idx, _ = self.robot.find_bodies(self.cfg.ee_link_name)
-
-        # Debug: Print joint information
-        print("\n[DofbotPickPlaceEnv] Joint Configuration:")
-        print(f"  Total robot joints: {self.robot.num_joints}")
-        print(f"  All joint names: {self.robot.joint_names}")
-        print(f"  Arm DOF indices: {self._arm_dof_idx}")
-        print(f"  Arm DOF names: {arm_names}")
-        print(f"  Gripper DOF indices: {self._grip_dof_idx}")
-        print(f"  Gripper DOF names: {grip_names}")
 
         # Shortcuts to buffers
         self.joint_pos = self.robot.data.joint_pos
         self.joint_vel = self.robot.data.joint_vel
 
-        # Placeholders for object/goal
+        # Per-environment caches for object/goal positions (env-local frame)
         self.obj_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
         self.goal_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
+        # Tracks whether each environment currently holds the object so rewards persist while carrying
+        self._grasp_state = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+
+        # Placement constraints (front sector + safety radius) pulled from cfg
+        axis = getattr(self.cfg, "placement_front_axis", "x")
+        if isinstance(axis, str):
+            axis = axis.lower()
+        else:
+            axis = "x"
+        if axis not in {"x", "y"}:
+            axis = "x"
+        self._front_axis = 0 if axis == "x" else 1
+        self._front_only = bool(getattr(self.cfg, "placement_front_only", False))
+        self._object_min_radius = float(getattr(self.cfg, "object_min_radius", 0.0))
+        self._goal_min_radius = float(getattr(self.cfg, "goal_min_radius", 0.0))
+        self._goal_object_min_sep = float(
+            getattr(self.cfg, "goal_object_min_separation", 0.0)
+        )
 
         # Configure joint drives after scene setup
         self._configure_joint_drives()
-
-        # Debug: Check if Object/Goal exist in multiple environments
-        print("\n[DofbotPickPlaceEnv] Checking Object/Goal in environments:")
-        stage = self.sim.stage
-        for env_idx in [0, 1, 2, 255]:  # Check first 3 and last env
-            obj_path = f"/World/envs/env_{env_idx}/Object"
-            goal_path = f"/World/envs/env_{env_idx}/Goal"
-            obj_exists = stage.GetPrimAtPath(obj_path).IsValid()
-            goal_exists = stage.GetPrimAtPath(goal_path).IsValid()
-            print(f"  env_{env_idx}: Object={obj_exists}, Goal={goal_exists}")
 
     # Scene ------------------------------------------------------------------
     def _setup_scene(self):
         # Robot
         self.robot = Articulation(self.cfg.robot_cfg)
 
-        # Ground - 밝은 회색 바닥 (렌더링 문제 해결)
-        ground_cfg = GroundPlaneCfg(
-            color=(0.4, 0.4, 0.4),  # 중간 회색
-            size=(100.0, 100.0),
-        )
-        spawn_ground_plane(prim_path="/World/ground", cfg=ground_cfg)
-
-        # Visual helpers: goal marker (sphere) and object (cube)
-        # Note: 스포너는 소스 env에만 생성 후 clone_environments로 복제됨
-        self._spawn_pickplace_assets()
+        # Create Object and Goal as RigidObjects for proper physics simulation
+        self.object = RigidObject(self.cfg.object_cfg)
+        self.goal = RigidObject(self.cfg.goal_cfg)
 
         # Clone envs
         self.scene.clone_environments(copy_from_source=False)
+        self._hide_env_ground_planes()
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
 
-        # Register
+        # Register articulations and rigid objects
         self.scene.articulations["robot"] = self.robot
+        self.scene.rigid_objects["object"] = self.object
+        self.scene.rigid_objects["goal"] = self.goal
 
         # Light - 더 밝게
         light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(1.0, 1.0, 1.0))
         light_cfg.func("/World/Light", light_cfg)
 
-    def _spawn_pickplace_assets(self):
-        # Object cube - 밝은 빨간색 큐브
-        cube_cfg = sim_utils.CuboidCfg(
-            size=(self.cfg.object_size, self.cfg.object_size, self.cfg.object_size),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False),
-            mass_props=sim_utils.MassPropertiesCfg(mass=0.05),
-            visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(1.0, 0.0, 0.0),  # 빨간색
-                metallic=0.2,
-                roughness=0.4,
-            ),
-        )
-        # Spawn under source env so that scene.clone_environments can replicate per env
-        cube_cfg.func("/World/envs/env_0/Object", cube_cfg)
+    def _hide_env_ground_planes(self) -> None:
+        """Hide environment ground planes cloned under each env namespace."""
+        stage = self.sim.stage
+        patterns = [
+            "/World/envs/env_.*/GroundPlane",
+            "/World/envs/env_.*/defaultGroundPlane",
+            "/World/envs/env_.*/Robot/GroundPlane",
+            "/World/envs/env_.*/Robot/defaultGroundPlane",
+        ]
 
-        # Goal sphere - 밝은 녹색 구체
-        goal_cfg = sim_utils.SphereCfg(
-            radius=0.03,  # 크기 증가
-            rigid_props=None,
-            visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(0.0, 1.0, 0.0),  # 녹색
-                emissive_color=(0.0, 0.5, 0.0),  # 발광 효과
-                metallic=0.0,
-                roughness=0.3,
-            ),
-        )
-        goal_cfg.func("/World/envs/env_0/Goal", goal_cfg)
+        hidden = set()
+        for pattern in patterns:
+            matches = sim_utils.find_matching_prim_paths(pattern, stage=stage)
+            for matched_path in matches:
+                if matched_path in hidden:
+                    continue
+                prim = stage.GetPrimAtPath(matched_path)
+                if not prim or not prim.IsValid():
+                    continue
+                imageable = UsdGeom.Imageable(prim)
+                if imageable:
+                    imageable.MakeInvisible()
+                hidden.add(matched_path)
 
     def _configure_joint_drives(self):
         """Configure joint drive properties for VELOCITY control for all environments."""
-        from pxr import UsdPhysics
+        from pxr import UsdPhysics  # type: ignore
 
         # Get USD stage from simulation context
         stage = self.sim.stage
 
-        print("\n[DofbotPickPlaceEnv] Configuring joint drives for VELOCITY control...")
         # Configure drives for ALL environments (not just env_0)
         for env_idx in range(self.num_envs):
             for joint_name in self.cfg.arm_dof_names + [self.cfg.gripper_dof_name]:
@@ -149,46 +151,19 @@ class DofbotPickPlaceEnv(DirectRLEnv):
                     drive_api = UsdPhysics.DriveAPI.Apply(joint_prim, "angular")
 
                     # Set drive parameters for VELOCITY control
-                    # High stiffness + high damping = good velocity tracking
-                    drive_api.CreateDampingAttr(
-                        1000.0
-                    )  # High damping for velocity control
-                    drive_api.CreateStiffnessAttr(
-                        0.0
-                    )  # Zero stiffness for velocity mode
-                    drive_api.CreateMaxForceAttr(
-                        1000.0
-                    )  # High force to achieve velocities
-
-                    if env_idx == 0:  # Only print for first env
-                        print(
-                            f"  Set drive for {joint_name}: damping=1000.0, stiffness=0.0, maxForce=1000.0"
-                        )
+                    drive_api.CreateDampingAttr(1000.0)
+                    drive_api.CreateStiffnessAttr(0.0)
+                    drive_api.CreateMaxForceAttr(1000.0)
 
     # Control/Step -----------------------------------------------------------
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = actions.clamp(-1.0, 1.0)
 
     def _apply_action(self) -> None:
-        # CHANGED: Use velocity control instead of effort (effort not working properly)
+        # Use velocity control instead of effort
         # Split arm (5 joints) and gripper (1 joint)
         arm_velocities = self.actions[:, :5] * self.cfg.joint_velocity_scale
         grip_velocity = self.actions[:, 5:6] * self.cfg.grip_velocity_scale
-
-        # Debug: Print first environment's action and joint state every 100 steps
-        if hasattr(self, "_step_count"):
-            self._step_count += 1
-        else:
-            self._step_count = 0
-
-        if self._step_count % 100 == 0:
-            print(f"\n[Step {self._step_count}] First {min(2, self.num_envs)} envs:")
-            for i in range(min(2, self.num_envs)):
-                joint_pos = self.joint_pos[i, self._arm_dof_idx].cpu().numpy()
-                joint_vel = self.joint_vel[i, self._arm_dof_idx].cpu().numpy()
-                print(
-                    f"  Env {i}: action={self.actions[i, :3].cpu().numpy()}, pos={joint_pos[:3]}, vel={joint_vel[:3]}"
-                )
 
         # Robot has 11 total joints, but we only control 6 (5 arm + 1 gripper)
         # Need to specify velocities for all joints - set uncontrolled joints to 0
@@ -205,13 +180,19 @@ class DofbotPickPlaceEnv(DirectRLEnv):
         # End-effector world position
         ee_pos_w = self.robot.data.body_pos_w[:, self._ee_body_idx[0]]
         grip = self.joint_pos[:, self._grip_dof_idx[0]].unsqueeze(-1)
+
+        # Refresh cached object/goal positions (env-local frame)
+        self._update_asset_states()
+        obj_pos_w = self.obj_pos_w
+        goal_pos_w = self.goal_pos_w
+
         obs = torch.cat(
             (
                 self.joint_pos[:, self._arm_dof_idx].reshape(self.num_envs, -1),
                 self.joint_vel[:, self._arm_dof_idx].reshape(self.num_envs, -1),
                 ee_pos_w,
-                self.obj_pos_w,
-                self.goal_pos_w,
+                obj_pos_w,
+                goal_pos_w,
                 grip,
             ),
             dim=-1,
@@ -222,22 +203,59 @@ class DofbotPickPlaceEnv(DirectRLEnv):
         ee_pos_w = self.robot.data.body_pos_w[:, self._ee_body_idx[0]]
         grip = self.joint_pos[:, self._grip_dof_idx[0]]
 
-        # Distances
-        d_reach = torch.linalg.norm(ee_pos_w - self.obj_pos_w, dim=-1)
-        d_place = torch.linalg.norm(self.obj_pos_w - self.goal_pos_w, dim=-1)
+        # Refresh cached object and goal states (convert back to world frame for distance metrics)
+        self._update_asset_states()
+        obj_pos_w = self.obj_pos_w + self.scene.env_origins
+        goal_pos_w = self.goal_pos_w + self.scene.env_origins
 
-        # Grasp heuristic
-        grasped = (d_reach < self.cfg.grasp_threshold) & (
-            grip < -0.2
-        )  # closed and close
+        # Distances and height
+        d_reach = torch.linalg.norm(ee_pos_w - obj_pos_w, dim=-1)
+        d_place = torch.linalg.norm(obj_pos_w - goal_pos_w, dim=-1)
+        table_contact = self.cfg.table_height + 0.5 * self.cfg.object_size
+        lift_height = torch.clamp(obj_pos_w[:, 2] - table_contact, min=0.0)
+        lift_norm = torch.clamp(
+            lift_height / max(self.cfg.lift_height_target, 1e-6), max=1.0
+        )
 
-        reward = (
-            self.cfg.rew_scale_alive
-            + self.cfg.rew_scale_reach * d_reach
-            + self.cfg.rew_scale_transport * d_place * grasped.float()
-            + self.cfg.rew_bonus_grasp * (d_reach < self.cfg.grasp_threshold).float()
-            + self.cfg.rew_bonus_place
-            * ((d_place < self.cfg.place_threshold) & grasped).float()
+        # Grasp-related masks
+        close_mask = d_reach < self.cfg.pre_grasp_threshold
+        grasp_candidate = (d_reach < self.cfg.grasp_threshold) & (
+            grip < self.cfg.grip_closed_threshold
+        )
+        release_condition = (grip > self.cfg.grip_open_threshold) | (
+            (lift_height < 0.005) & (~grasp_candidate)
+        )
+        self._grasp_state |= grasp_candidate
+        self._grasp_state &= ~release_condition
+        grasped_mask = self._grasp_state
+        grasped_float = grasped_mask.float()
+
+        # Gripper closure quality (0..1)
+        closure_delta = torch.clamp(
+            self.cfg.grip_closed_threshold - grip,
+            min=0.0,
+            max=self.cfg.grip_close_range,
+        )
+        closure_quality = closure_delta / max(self.cfg.grip_close_range, 1e-6)
+
+        # Reward shaping terms
+        reward = torch.full(
+            (self.num_envs,), self.cfg.rew_scale_alive, device=self.device
+        )
+        reward += self.cfg.rew_scale_reach * d_reach
+        reward += self.cfg.rew_scale_close * close_mask.float() * closure_quality
+        reward += self.cfg.rew_scale_lift * grasped_float * lift_norm
+        reward += self.cfg.rew_scale_goal_track * grasped_float * d_place
+        reward += self.cfg.rew_penalty_open * torch.clamp(
+            grip - self.cfg.grip_open_threshold, min=0.0
+        )
+        reward += (
+            self.cfg.rew_bonus_grasp
+            * (close_mask & (grip < self.cfg.grip_closed_threshold)).float()
+        )
+        reward += (
+            self.cfg.rew_bonus_place
+            * ((d_place < self.cfg.place_threshold) & grasped_mask).float()
         )
         return reward
 
@@ -246,13 +264,13 @@ class DofbotPickPlaceEnv(DirectRLEnv):
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
         # Success as termination (place achieved)
-        d_place = torch.linalg.norm(self.obj_pos_w - self.goal_pos_w, dim=-1)
-        grip = self.joint_pos[:, self._grip_dof_idx[0]]
-        d_reach = torch.linalg.norm(
-            self.robot.data.body_pos_w[:, self._ee_body_idx[0]] - self.obj_pos_w, dim=-1
-        )
-        grasped = (d_reach < self.cfg.grasp_threshold) & (grip < -0.2)
-        success = (d_place < self.cfg.place_threshold) & grasped
+        self._update_asset_states()
+        obj_pos_w = self.obj_pos_w + self.scene.env_origins
+        goal_pos_w = self.goal_pos_w + self.scene.env_origins
+
+        d_place = torch.linalg.norm(obj_pos_w - goal_pos_w, dim=-1)
+        grasped_mask = self._grasp_state
+        success = (d_place < self.cfg.place_threshold) & grasped_mask
         return success, time_out
 
     # Reset ---------------------------------------------------------------
@@ -260,6 +278,20 @@ class DofbotPickPlaceEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
         super()._reset_idx(env_ids)
+
+        if isinstance(env_ids, torch.Tensor):
+            env_tensor = env_ids.to(device=self.device, dtype=torch.long)
+        elif isinstance(env_ids, slice):
+            env_tensor = torch.arange(
+                self.num_envs, device=self.device, dtype=torch.long
+            )
+        else:
+            env_tensor = torch.tensor(
+                list(env_ids), device=self.device, dtype=torch.long
+            )
+        env_tensor = env_tensor.reshape(-1)
+        env_count = env_tensor.shape[0]
+        self._grasp_state[env_tensor] = False
 
         # Reset robot state to defaults + small noise
         joint_pos = self.robot.data.default_joint_pos[env_ids]
@@ -281,89 +313,214 @@ class DofbotPickPlaceEnv(DirectRLEnv):
         self.robot.write_root_velocity_to_sim(default_root[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
-        # Reset object & goal positions (world)
-        # Object on table (z = table_height + half size)
-        obj_xy = self._sample_xy(env_ids, self.cfg.object_xy_range)
+        # Reset object & goal positions using RigidObject API
+        # Sample random positions in local frame
+        obj_xy = self._sample_xy(
+            env_ids,
+            self.cfg.object_xy_range,
+            min_radius=self._object_min_radius,
+            front_only=self._front_only,
+        )
         obj_z = torch.full(
-            (len(env_ids), 1),
+            (env_count, 1),
             self.cfg.table_height + 0.5 * self.cfg.object_size,
             device=self.device,
         )
-        obj_pos = torch.cat((obj_xy, obj_z), dim=-1)
+        obj_pos_local = torch.cat((obj_xy, obj_z), dim=-1)
 
-        # Goal above table
-        goal_xy = self._sample_xy(env_ids, self.cfg.goal_xy_range)
-        goal_z = torch.full((len(env_ids), 1), self.cfg.goal_height, device=self.device)
-        goal_pos = torch.cat((goal_xy, goal_z), dim=-1)
+        goal_xy = self._sample_goal_xy(
+            env_ids,
+            obj_xy,
+        )
+        goal_z = torch.full((env_count, 1), self.cfg.goal_height, device=self.device)
+        goal_pos_local = torch.cat((goal_xy, goal_z), dim=-1)
 
-        # Add env origins
-        obj_pos = obj_pos + self.scene.env_origins[env_ids]
-        goal_pos = goal_pos + self.scene.env_origins[env_ids]
+        # Convert to world frame
+        obj_pos_w = obj_pos_local + self.scene.env_origins[env_ids]
+        goal_pos_w = goal_pos_local + self.scene.env_origins[env_ids]
 
-        self.obj_pos_w[env_ids] = obj_pos
-        self.goal_pos_w[env_ids] = goal_pos
+        # Create root state tensors for RigidObjects [pos(3), quat(4), lin_vel(3), ang_vel(3)]
+        object_state = torch.zeros((env_count, 13), device=self.device)
+        object_state[:, :3] = obj_pos_w
+        object_state[:, 3] = 1.0  # Identity quaternion (w = 1)
 
-        # Move prims (visual markers) per env
-        ident_quat = torch.tensor([1, 0, 0, 0], device=self.device)
-        for i, env_id in enumerate(env_ids):
-            env_idx = int(env_id)
-            self._set_prim_world_pose(
-                f"/World/envs/env_{env_idx}/Object", obj_pos[i], ident_quat
-            )
-            self._set_prim_world_pose(
-                f"/World/envs/env_{env_idx}/Goal", goal_pos[i], ident_quat
-            )
+        goal_state = torch.zeros((env_count, 13), device=self.device)
+        goal_state[:, :3] = goal_pos_w
+        goal_state[:, 3] = 1.0
+
+        # Keep local caches aligned with newly sampled poses
+        self.obj_pos_w[env_tensor] = obj_pos_local
+        self.goal_pos_w[env_tensor] = goal_pos_local
+
+        # Write to simulation using RigidObject API
+        self.object.write_root_state_to_sim(object_state, env_ids)
+        self.goal.write_root_state_to_sim(goal_state, env_ids)
 
     # Utils ---------------------------------------------------------------
     def _sample_xy(
-        self, env_ids: Sequence[int], xy_range: tuple[float, float]
+        self,
+        env_ids: Sequence[int],
+        xy_range: tuple[float, float],
+        min_radius: float = 0.0,
+        front_only: bool = False,
     ) -> torch.Tensor:
         low, high = xy_range
-        xy = low + (high - low) * torch.rand((len(env_ids), 2), device=self.device)
-        return xy
+        max_radius = max(abs(low), abs(high))
+        max_radius = max(max_radius, 1e-4)
+        radial_min = max(0.0, float(min_radius))
+        if radial_min >= max_radius:
+            radial_min = max_radius - 1e-5
+        span = max(max_radius - radial_min, 1e-5)
 
-    def _set_prim_world_pose(
-        self, prim_path: str, pos: torch.Tensor, quat_wxyz: torch.Tensor
-    ) -> None:
-        """Set a prim's world pose using USD Xform ops.
-
-        Note: quat expected as [w, x, y, z].
-        """
-        try:
-            import omni.usd
-            from pxr import UsdGeom, Gf
-
-            stage = omni.usd.get_context().get_stage()
-            prim = stage.GetPrimAtPath(prim_path)
-            if not prim.IsValid():
-                return
-            xformable = UsdGeom.Xformable(prim)
-            # Clear existing ops order and set translate + orient
-            # Use dedicated ops to avoid stacking transforms over time
-            # Create ops (will reuse if they already exist with same opSuffix)
-            translate_op = None
-            orient_op = None
-            # Reuse existing ops if present
-            for op in xformable.GetOrderedXformOps():
-                if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
-                    translate_op = op
-                elif op.GetOpType() == UsdGeom.XformOp.TypeOrient:
-                    orient_op = op
-            if translate_op is None:
-                translate_op = xformable.AddTranslateOp()
-            if orient_op is None:
-                orient_op = xformable.AddOrientOp()
-
-            translate_op.Set(Gf.Vec3f(float(pos[0]), float(pos[1]), float(pos[2])))
-            orient_op.Set(
-                Gf.Quatf(
-                    float(quat_wxyz[0]),
-                    Gf.Vec3f(
-                        float(quat_wxyz[1]), float(quat_wxyz[2]), float(quat_wxyz[3])
-                    ),
-                )
+        # Normalize env_ids into a tensor on the current device for deterministic hashing
+        if isinstance(env_ids, slice):
+            env_tensor = torch.arange(
+                self.num_envs, device=self.device, dtype=torch.long
             )
-            xformable.SetXformOpOrder([translate_op, orient_op])
-        except Exception:
-            # Silently ignore pose set failures (visual-only helper)
-            pass
+        elif isinstance(env_ids, torch.Tensor):
+            env_tensor = env_ids.to(device=self.device, dtype=torch.long)
+        else:
+            env_tensor = torch.tensor(
+                list(env_ids), device=self.device, dtype=torch.long
+            )
+        env_tensor = env_tensor.reshape(-1)
+
+        front_flag = front_only or getattr(self, "_front_only", False)
+
+        # Base random component (common generator ensures reproducibility across runs)
+        base = torch.rand((env_tensor.shape[0], 3), device=self.device)
+        # Offset samples with hashed env-dependent phases to avoid perfectly correlated resets
+        hash_offsets = torch.frac(
+            torch.stack(
+                (
+                    env_tensor.float() * 0.61803398875,
+                    env_tensor.float() * 0.38196601125,
+                    env_tensor.float() * 0.17320508076,
+                ),
+                dim=-1,
+            )
+        )
+        samples = torch.frac(base + hash_offsets)
+
+        radius = radial_min + span * samples[:, 0]
+        if front_flag:
+            angles = (samples[:, 1] - 0.5) * math.pi  # [-pi/2, pi/2]
+        else:
+            angles = samples[:, 1] * 2.0 * math.pi  # [0, 2pi]
+
+        forward = radius * torch.cos(angles)
+        lateral = radius * torch.sin(angles)
+
+        if front_flag:
+            forward = torch.clamp_min(forward, 1e-4)
+
+        coords = torch.stack((forward, lateral), dim=-1)
+        if getattr(self, "_front_axis", 0) == 1:
+            coords = coords[:, [1, 0]]
+
+        coords = coords.clamp(min=low, max=high)
+        return coords
+
+    def _sample_goal_xy(
+        self,
+        env_ids: Sequence[int],
+        obj_xy: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sample goal XY positions with a minimum separation from the object."""
+        env_tensor = self._to_env_tensor(env_ids)
+        goal_xy = torch.zeros((env_tensor.shape[0], 2), device=self.device)
+
+        remaining_pos = torch.arange(
+            env_tensor.shape[0], device=self.device, dtype=torch.long
+        )
+        attempts = 0
+        max_attempts = 24
+        min_sep = max(0.0, self._goal_object_min_sep)
+        separation_tol = min_sep + 0.01 if min_sep > 0.0 else 0.0
+
+        while remaining_pos.numel() > 0 and attempts < max_attempts:
+            env_subset = env_tensor[remaining_pos]
+            candidates = self._sample_xy(
+                env_subset,
+                self.cfg.goal_xy_range,
+                min_radius=self._goal_min_radius,
+                front_only=self._front_only,
+            )
+            if min_sep > 0.0:
+                dists = torch.linalg.norm(candidates - obj_xy[remaining_pos], dim=-1)
+                mask = dists >= separation_tol
+            else:
+                mask = torch.ones_like(
+                    remaining_pos, dtype=torch.bool, device=self.device
+                )
+
+            if mask.any():
+                accepted_pos = remaining_pos[mask]
+                goal_xy[accepted_pos] = candidates[mask]
+                remaining_pos = remaining_pos[~mask]
+            attempts += 1
+
+        # Fallback: if separation not satisfied for some envs, shift forward from object
+        if remaining_pos.numel() > 0:
+            obj_rem = obj_xy[remaining_pos]
+            axis = self._front_axis
+            lat_axis = 1 - axis
+            low, high = self.cfg.goal_xy_range
+            front_min = max(min_sep, 1e-4)
+
+            if separation_tol <= 0.0:
+                separation_tol = 0.12
+
+            fallback = obj_rem.clone()
+            # Encourage goals to land further away along front axis
+            forward_offset = separation_tol + 0.05
+            fallback[:, axis] = torch.clamp(
+                obj_rem[:, axis] + forward_offset, min=front_min, max=high
+            )
+
+            # Lateral spread: push towards edges based on random sign
+            rand_sign = torch.where(
+                torch.rand_like(obj_rem[:, lat_axis]) > 0.5, 1.0, -1.0
+            )
+            lateral_offset = separation_tol + 0.05
+            fallback[:, lat_axis] = obj_rem[:, lat_axis] + rand_sign * lateral_offset
+            fallback[:, lat_axis] = torch.clamp(
+                fallback[:, lat_axis], min=low, max=high
+            )
+
+            diff = fallback - obj_rem
+            dist = torch.linalg.norm(diff, dim=-1)
+            short_mask = dist < min_sep
+            if short_mask.any():
+                fallback_fix = fallback[short_mask]
+                fallback_fix[:, axis] = high
+                fallback_fix[:, lat_axis] = torch.where(
+                    obj_rem[short_mask, lat_axis] >= 0.0, low, high
+                )
+                fallback[short_mask] = fallback_fix
+
+            goal_xy[remaining_pos] = fallback
+
+        return goal_xy
+
+    def _to_env_tensor(self, env_ids: Sequence[int]) -> torch.Tensor:
+        if isinstance(env_ids, slice):
+            env_tensor = torch.arange(
+                self.num_envs, device=self.device, dtype=torch.long
+            )
+        elif isinstance(env_ids, torch.Tensor):
+            env_tensor = env_ids.to(device=self.device, dtype=torch.long)
+        else:
+            env_tensor = torch.tensor(
+                list(env_ids), device=self.device, dtype=torch.long
+            )
+        return env_tensor.reshape(-1)
+
+    def _update_asset_states(self) -> None:
+        """Refresh cached object and goal poses in the env-local frame."""
+        torch.sub(
+            self.object.data.root_pos_w, self.scene.env_origins, out=self.obj_pos_w
+        )
+        torch.sub(
+            self.goal.data.root_pos_w, self.scene.env_origins, out=self.goal_pos_w
+        )
