@@ -1,0 +1,67 @@
+seed: 42
+
+models:
+  separate: False
+  policy:
+    class: GaussianMixin
+    clip_actions: True
+    clip_log_std: True
+    min_log_std: -5.0
+    max_log_std: 2.0
+    initial_log_std: 0.0 # V2: Higher initial exploration
+    network:
+      - name: net
+        input: OBSERVATIONS
+        layers: [512, 512, 256, 128] # V2: Deeper network for complex curriculum
+        activations: elu
+    output: ACTIONS
+  value:
+    class: DeterministicMixin
+    clip_actions: False
+    network:
+      - name: net
+        input: OBSERVATIONS
+        layers: [512, 512, 256, 128] # V2: Deeper network
+        activations: elu
+    output: ONE
+
+memory:
+  class: RandomMemory
+  memory_size: -1
+
+agent:
+  class: PPO
+  rollouts: 128 # V2: More rollouts for better exploration
+  learning_epochs: 10 # V2: More epochs per update
+  mini_batches: 16 # V2: More mini-batches
+  discount_factor: 0.99
+  lambda: 0.95
+  learning_rate: 1.0e-04 # V2: Lower learning rate for stability
+  learning_rate_scheduler: KLAdaptiveLR
+  learning_rate_scheduler_kwargs:
+    kl_threshold: 0.015 # V2: Tighter KL constraint
+  state_preprocessor: RunningStandardScaler
+  state_preprocessor_kwargs: null
+  value_preprocessor: RunningStandardScaler
+  value_preprocessor_kwargs: null
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 0.5 # V2: Tighter gradient clipping
+  ratio_clip: 0.2
+  value_clip: 0.2
+  clip_predicted_values: True
+  entropy_loss_scale: 0.005 # V2: Higher entropy for exploration
+  value_loss_scale: 1.0 # V2: Lower value loss weight
+  kl_threshold: 0.0
+  rewards_shaper_scale: 1.0
+  time_limit_bootstrap: False
+  experiment:
+    directory: "dofbot_pickplace_direct_v2"
+    experiment_name: ""
+    write_interval: auto
+    checkpoint_interval: auto
+
+trainer:
+  class: SequentialTrainer
+  timesteps: 1000000 # V2: Longer training for curriculum learning
+  environment_info: log

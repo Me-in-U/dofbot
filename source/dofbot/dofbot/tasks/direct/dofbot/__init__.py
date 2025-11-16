@@ -21,3 +21,23 @@ gym.register(
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_pickplace_cfg.yaml",
     },
 )
+
+gym.register(
+    id="Dofbot-PickPlace-Direct-v2",
+    entry_point=f"{__name__}.dofbot_pickplace_env_v2:DofbotPickPlaceEnvV2",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.dofbot_pickplace_env_cfg_v2:DofbotPickPlaceEnvCfgV2",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_pickplace_v2_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="Dofbot-PickPlace-Direct-v3",
+    entry_point=f"{__name__}.dofbot_pickplace_env_v3:DofbotPickPlaceEnvV3",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.dofbot_pickplace_env_cfg_v3:DofbotPickPlaceEnvCfgV3",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_pickplace_v3_cfg.yaml",
+    },
+)
